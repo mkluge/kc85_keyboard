@@ -34,7 +34,9 @@ Kc85Keyboard::Kc85Keyboard(uint8_t dataPin) : dataPin_(dataPin) {}
 
 void Kc85Keyboard::begin()
 {
-  digitalWrite(dataPin_, HIGH);
+  // The external transistor inverts the GPIO level. Keep the GPIO LOW while
+  // idle so the KC-side signal is HIGH.
+  digitalWrite(dataPin_, LOW);
   pinMode(dataPin_, OUTPUT);
 }
 
@@ -212,13 +214,14 @@ uint32_t Kc85Keyboard::sendFrame(uint8_t ibusCode)
 
 void Kc85Keyboard::sendBurst()
 {
-  // Five low pulses consist of nine 16 us half-periods: L-H-L-H-L-H-L-H-L.
-  // The final transition to HIGH ends the documented 144 us burst.
+  // The external transistor is inverting, so GPIO HIGH produces each
+  // active-low pulse on the KC side. Five pulses occupy nine 16 us
+  // half-periods; the final transition to GPIO LOW ends the 144 us burst.
   for (uint8_t pulse = 0; pulse < 5; ++pulse)
   {
-    digitalWrite(dataPin_, LOW);
-    delayMicroseconds(16);
     digitalWrite(dataPin_, HIGH);
+    delayMicroseconds(16);
+    digitalWrite(dataPin_, LOW);
     if (pulse < 4)
     {
       delayMicroseconds(16);
