@@ -116,9 +116,9 @@ public:
   bool isPressed() const;
   bool isShifted() const;
 
-  // Documented IBUS notation uses bit 7 for the shift plane and bits 0..5
-  // for the matrix position. Bit 6 is unused.
-  // key and shifted are converted into that documented notation.
+  // The received IBUS value uses bit 7 for the plane and bits 0..5 for the
+  // matrix position. Bit 6 is unused. The hardware path has inverted plane
+  // polarity, so shifted=false transmits bit 7 set and shifted=true clears it.
   static uint8_t ibusForKey(KcKey key, bool shifted);
 
   // iso7Code is searched in the table; key and shifted receive the result.

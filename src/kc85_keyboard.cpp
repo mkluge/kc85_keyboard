@@ -136,7 +136,7 @@ bool Kc85Keyboard::isShifted() const
 uint8_t Kc85Keyboard::ibusForKey(KcKey key, bool shifted)
 {
   return static_cast<uint8_t>(static_cast<uint8_t>(key) |
-                              (shifted ? 0x80U : 0x00U));
+                              (shifted ? 0x00U : 0x80U));
 }
 
 bool Kc85Keyboard::keyForIso7(uint8_t iso7Code, KcKey &key, bool &shifted)

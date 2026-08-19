@@ -62,6 +62,7 @@ void pressCurrentTestKey(uint32_t now)
   }
 }
 
+
 void setup()
 {
   kcKeyboard.begin();
