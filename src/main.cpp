@@ -11,11 +11,14 @@
 #include <cctype>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace {
 constexpr uint16_t kHidServiceUuid = 0x1812;
 constexpr uint16_t kReportUuid = 0x2A4D;
 constexpr uint16_t kBootKeyboardInputUuid = 0x2A22;
+constexpr char kKeyboardName[] = "MX Keys Mini";
+constexpr char kKeyboardNameMatch[] = "mx keys mini";
 constexpr uint32_t kScanSeconds = 5;
 constexpr uint32_t kRetryDelayMs = 1500;
 constexpr uint32_t kKeyFlashMs = 100;
@@ -24,6 +27,7 @@ constexpr uint8_t kLedBrightness = 24;
 BLEClient *client = nullptr;
 BLEAddress *keyboardAddress = nullptr;
 esp_ble_addr_type_t keyboardAddressType = BLE_ADDR_TYPE_PUBLIC;
+std::vector<BLEAddress> bondedAddresses;
 
 volatile bool connectRequested = false;
 volatile bool connected = false;
@@ -45,6 +49,37 @@ bool containsIgnoringCase(std::string value, const char *needle) {
   return value.find(needle) != std::string::npos;
 }
 
+bool isBondedAddress(const BLEAddress &address) {
+  return std::find(bondedAddresses.begin(), bondedAddresses.end(), address) !=
+         bondedAddresses.end();
+}
+
+void rememberBondedAddress(const BLEAddress &address) {
+  if (!isBondedAddress(address)) {
+    bondedAddresses.push_back(address);
+  }
+}
+
+void loadBondedAddresses() {
+  int count = esp_ble_get_bond_device_num();
+  if (count <= 0) {
+    Serial.println("No stored keyboard bond; initial pairing is required");
+    return;
+  }
+
+  std::vector<esp_ble_bond_dev_t> devices(static_cast<size_t>(count));
+  if (esp_ble_get_bond_device_list(&count, devices.data()) != ESP_OK) {
+    Serial.println("Could not read stored BLE bonds");
+    return;
+  }
+
+  for (int i = 0; i < count; ++i) {
+    rememberBondedAddress(BLEAddress(devices[i].bd_addr));
+  }
+  Serial.printf("Loaded %u stored BLE bond(s) for automatic reconnection\n",
+                static_cast<unsigned>(bondedAddresses.size()));
+}
+
 void onHidReport(BLERemoteCharacteristic *, uint8_t *data, size_t length,
                  bool) {
   // A release report contains only zeroes. Modifiers and normal keys both set
@@ -61,8 +96,11 @@ void onHidReport(BLERemoteCharacteristic *, uint8_t *data, size_t length,
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
  public:
   void onResult(BLEAdvertisedDevice device) override {
-    const bool namedPeriboard =
-        device.haveName() && containsIgnoringCase(device.getName(), "periboard");
+    const BLEAddress advertisedAddress = device.getAddress();
+    const bool namedMxKeysMini =
+        device.haveName() &&
+        containsIgnoringCase(device.getName(), kKeyboardNameMatch);
+    const bool knownBond = isBondedAddress(advertisedAddress);
     const bool advertisesHid =
         device.haveServiceUUID() &&
         device.isAdvertisingService(BLEUUID(kHidServiceUuid));
@@ -73,14 +111,15 @@ class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
                   device.haveRSSI() ? device.getRSSI() : -999,
                   advertisesHid ? " | HID" : "");
 
-    if (!namedPeriboard) {
+    if (!namedMxKeysMini && !knownBond) {
       return;
     }
 
-    Serial.println("PERIBOARD candidate selected");
+    Serial.println(knownBond ? "Bonded keyboard selected for reconnection"
+                             : "MX Keys Mini candidate selected");
 
     delete keyboardAddress;
-    keyboardAddress = new BLEAddress(device.getAddress());
+    keyboardAddress = new BLEAddress(advertisedAddress);
     keyboardAddressType = device.getAddressType();
     connectRequested = true;
     BLEDevice::getScan()->stop();
@@ -110,7 +149,7 @@ class KeyboardSecurityCallbacks : public BLESecurityCallbacks {
   void onPassKeyNotify(uint32_t passkey) override {
     Serial.printf("Pairing code: %06lu\n",
                   static_cast<unsigned long>(passkey));
-    Serial.println("Type this code on the PERIBOARD, then press Enter");
+    Serial.println("Type this code on the MX Keys Mini, then press Enter");
   }
 
   bool onSecurityRequest() override { return true; }
@@ -119,6 +158,7 @@ class KeyboardSecurityCallbacks : public BLESecurityCallbacks {
     authenticated = result.success;
     authenticationFinished = true;
     if (result.success) {
+      rememberBondedAddress(BLEAddress(result.bd_addr));
       Serial.println("Keyboard paired and bonded");
     } else {
       Serial.printf("Pairing failed (reason 0x%02x)\n", result.fail_reason);
@@ -207,7 +247,7 @@ bool connectToKeyboard() {
 }
 
 void scanForKeyboard() {
-  Serial.println("Scanning for PERIBOARD-805...");
+  Serial.printf("Scanning for %s...\n", kKeyboardName);
   BLEScan *scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&advertisementCallbacks);
   scan->setActiveScan(true);
@@ -233,7 +273,7 @@ void setup() {
     delay(10);
   }
   Serial.println();
-  Serial.println("PERIBOARD-805 firmware starting");
+  Serial.println("MX Keys Mini firmware starting");
 
   pinMode(NEOPIXEL_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
@@ -245,9 +285,12 @@ void setup() {
   BLEDevice::setSecurityCallbacks(&securityCallbacks);
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
   security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-  security.setCapability(ESP_IO_CAP_NONE);
+  // The MX Keys Mini enters a passkey displayed by its host. Advertise a
+  // display-only capability so the passkey arrives in onPassKeyNotify().
+  security.setCapability(ESP_IO_CAP_OUT);
   security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  loadBondedAddresses();
 
   Serial.println("Select a Bluetooth slot and put the keyboard in pairing mode");
 }
