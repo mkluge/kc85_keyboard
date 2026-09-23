@@ -6,12 +6,17 @@
 #include <BLERemoteService.h>
 #include <BLEScan.h>
 #include <BLESecurity.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #include <algorithm>
 #include <cctype>
-#include <map>
+#include <cstring>
 #include <string>
 #include <vector>
+
+#include "hid_keyboard.h"
+#include "kc85_keyboard.h"
 
 namespace {
 constexpr uint16_t kHidServiceUuid = 0x1812;
@@ -23,17 +28,21 @@ constexpr uint32_t kScanSeconds = 5;
 constexpr uint32_t kRetryDelayMs = 1500;
 constexpr uint32_t kKeyFlashMs = 100;
 constexpr uint8_t kLedBrightness = 24;
+constexpr uint8_t kKcDataPin = 1;
+constexpr uint8_t kKeyboardReportQueueLength = 16;
+constexpr uint8_t kShiftModifierMask = 0x22;
 
 BLEClient *client = nullptr;
 BLEAddress *keyboardAddress = nullptr;
 esp_ble_addr_type_t keyboardAddressType = BLE_ADDR_TYPE_PUBLIC;
 std::vector<BLEAddress> bondedAddresses;
+QueueHandle_t keyboardReportQueue = nullptr;
+Kc85Keyboard kcKeyboard(kKcDataPin);
 
 volatile bool connectRequested = false;
 volatile bool connected = false;
 volatile bool authenticated = false;
 volatile bool authenticationFinished = false;
-volatile bool keyEventPending = false;
 
 uint32_t nextScanAt = 0;
 uint32_t ledOffAt = 0;
@@ -80,17 +89,61 @@ void loadBondedAddresses() {
                 static_cast<unsigned>(bondedAddresses.size()));
 }
 
+void enqueueKeyboardReport(const HidKeyboardReport &report) {
+  if (keyboardReportQueue == nullptr) {
+    return;
+  }
+
+  if (xQueueSend(keyboardReportQueue, &report, 0) != pdTRUE) {
+    // Retain the most recent transitions if an unusual burst fills the queue.
+    HidKeyboardReport discarded;
+    xQueueReceive(keyboardReportQueue, &discarded, 0);
+    xQueueSend(keyboardReportQueue, &report, 0);
+  }
+}
+
 void onHidReport(BLERemoteCharacteristic *, uint8_t *data, size_t length,
                  bool) {
-  // A release report contains only zeroes. Modifiers and normal keys both set
-  // at least one bit, so this identifies key-down reports without decoding the
-  // keyboard layout.
-  for (size_t i = 0; i < length; ++i) {
-    if (data[i] != 0) {
-      keyEventPending = true;
+  // Keyboard input reports use the standard boot-keyboard shape. Other
+  // notifiable HID reports (consumer/media controls, for example) are ignored.
+  if (length != sizeof(HidKeyboardReport)) {
+    return;
+  }
+
+  HidKeyboardReport report;
+  std::memcpy(&report, data, sizeof(report));
+  enqueueKeyboardReport(report);
+}
+
+bool reportHasPressedKey(const HidKeyboardReport &report) {
+  if (report.modifiers != 0) {
+    return true;
+  }
+  for (uint8_t usage : report.keys) {
+    if (usage != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void applyKeyboardReport(const HidKeyboardReport &report) {
+  if (reportHasPressedKey(report)) {
+    setLed(true);
+    ledOffAt = millis() + kKeyFlashMs;
+  }
+
+  const bool shifted = (report.modifiers & kShiftModifierMask) != 0;
+  for (uint8_t usage : report.keys) {
+    uint8_t iso7Code;
+    if (usage != 0 && hidUsageToIso7(usage, shifted, iso7Code) &&
+        kcKeyboard.pressIso7(iso7Code)) {
       return;
     }
   }
+
+  // A release, modifier-only report, or unsupported key stops KC85 repeats.
+  kcKeyboard.releaseKey();
 }
 
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -135,6 +188,7 @@ class KeyboardClientCallbacks : public BLEClientCallbacks {
     authenticated = false;
     authenticationFinished = false;
     nextScanAt = millis() + kRetryDelayMs;
+    enqueueKeyboardReport(HidKeyboardReport{});
     Serial.println("Keyboard disconnected; scanning will resume");
   }
 };
@@ -279,6 +333,13 @@ void setup() {
   digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
   setLed(false);
 
+  kcKeyboard.begin();
+  keyboardReportQueue =
+      xQueueCreate(kKeyboardReportQueueLength, sizeof(HidKeyboardReport));
+  if (keyboardReportQueue == nullptr) {
+    Serial.println("Could not allocate the HID keyboard report queue");
+  }
+
   Serial.println("Initializing BLE...");
   BLEDevice::init("QT Py keyboard host");
   Serial.println("BLE initialized");
@@ -296,11 +357,12 @@ void setup() {
 }
 
 void loop() {
-  if (keyEventPending) {
-    keyEventPending = false;
-    setLed(true);
-    ledOffAt = millis() + kKeyFlashMs;
+  HidKeyboardReport report;
+  if (keyboardReportQueue != nullptr &&
+      xQueueReceive(keyboardReportQueue, &report, 0) == pdTRUE) {
+    applyKeyboardReport(report);
   }
+  kcKeyboard.service();
 
   if (ledOffAt != 0 && static_cast<int32_t>(millis() - ledOffAt) >= 0) {
     setLed(false);
