@@ -127,7 +127,68 @@ bool reportHasPressedKey(const HidKeyboardReport &report) {
   return false;
 }
 
+void printHidUsage(uint8_t usage) {
+  if (usage >= 0x04 && usage <= 0x1D) {
+    Serial.printf("%c(0x%02X)", 'A' + usage - 0x04, usage);
+    return;
+  }
+  if (usage >= 0x1E && usage <= 0x26) {
+    Serial.printf("%c(0x%02X)", '1' + usage - 0x1E, usage);
+    return;
+  }
+  if (usage == 0x27) {
+    Serial.printf("0(0x%02X)", usage);
+    return;
+  }
+  if (usage >= 0x3A && usage <= 0x45) {
+    Serial.printf("F%u(0x%02X)", usage - 0x3A + 1, usage);
+    return;
+  }
+
+  const char *name = nullptr;
+  switch (usage) {
+    case 0x28: name = "Enter"; break;
+    case 0x29: name = "Escape"; break;
+    case 0x2A: name = "Backspace"; break;
+    case 0x2B: name = "Tab"; break;
+    case 0x2C: name = "Space"; break;
+    case 0x39: name = "CapsLock"; break;
+    case 0x48: name = "Pause"; break;
+    case 0x49: name = "Insert"; break;
+    case 0x4A: name = "Home"; break;
+    case 0x4C: name = "Delete"; break;
+    case 0x4F: name = "Right"; break;
+    case 0x50: name = "Left"; break;
+    case 0x51: name = "Down"; break;
+    case 0x52: name = "Up"; break;
+    default: break;
+  }
+
+  if (name != nullptr) {
+    Serial.printf("%s(0x%02X)", name, usage);
+  } else {
+    Serial.printf("0x%02X", usage);
+  }
+}
+
+void printKeyboardReport(const HidKeyboardReport &report) {
+  Serial.printf("[KEY] modifiers=0x%02X keys=[", report.modifiers);
+  bool first = true;
+  for (uint8_t usage : report.keys) {
+    if (usage == 0) {
+      continue;
+    }
+    if (!first) {
+      Serial.print(", ");
+    }
+    printHidUsage(usage);
+    first = false;
+  }
+  Serial.println("]");
+}
+
 void applyKeyboardReport(const HidKeyboardReport &report) {
+  printKeyboardReport(report);
   if (reportHasPressedKey(report)) {
     setLed(true);
     ledOffAt = millis() + kKeyFlashMs;
@@ -138,12 +199,22 @@ void applyKeyboardReport(const HidKeyboardReport &report) {
     uint8_t iso7Code;
     if (usage != 0 && hidUsageToIso7(usage, shifted, iso7Code) &&
         kcKeyboard.pressIso7(iso7Code)) {
+      KcKey kcKey;
+      bool kcShifted;
+      Kc85Keyboard::keyForIso7(iso7Code, kcKey, kcShifted);
+      Serial.printf("[KEY] HID 0x%02X -> ISO-7 0x%02X -> KC85 IBUS 0x%02X",
+                    usage, iso7Code,
+                    Kc85Keyboard::ibusForKey(kcKey, kcShifted));
+      Serial.println();
       return;
     }
   }
 
   // A release, modifier-only report, or unsupported key stops KC85 repeats.
   kcKeyboard.releaseKey();
+  Serial.println(reportHasPressedKey(report)
+                     ? "[KEY] no supported KC85 key in report"
+                     : "[KEY] all keys released");
 }
 
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -168,8 +239,8 @@ class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
       return;
     }
 
-    Serial.println(knownBond ? "Bonded keyboard selected for reconnection"
-                             : "MX Keys Mini candidate selected");
+    Serial.println(knownBond ? "[STATUS] bonded keyboard found; reconnecting"
+                             : "[STATUS] MX Keys Mini found; pairing required");
 
     delete keyboardAddress;
     keyboardAddress = new BLEAddress(advertisedAddress);
@@ -181,7 +252,9 @@ class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
 
 class KeyboardClientCallbacks : public BLEClientCallbacks {
  public:
-  void onConnect(BLEClient *) override { Serial.println("BLE link connected"); }
+  void onConnect(BLEClient *) override {
+    Serial.println("[STATUS] BLE link connected; authenticating");
+  }
 
   void onDisconnect(BLEClient *) override {
     connected = false;
@@ -189,21 +262,21 @@ class KeyboardClientCallbacks : public BLEClientCallbacks {
     authenticationFinished = false;
     nextScanAt = millis() + kRetryDelayMs;
     enqueueKeyboardReport(HidKeyboardReport{});
-    Serial.println("Keyboard disconnected; scanning will resume");
+    Serial.println("[STATUS] keyboard disconnected; scanning will resume");
   }
 };
 
 class KeyboardSecurityCallbacks : public BLESecurityCallbacks {
  public:
   uint32_t onPassKeyRequest() override {
-    Serial.println("Keyboard requested a passkey from the ESP32");
+    Serial.println("[PAIRING] keyboard requested a passkey from the ESP32");
     return 0;
   }
 
   void onPassKeyNotify(uint32_t passkey) override {
-    Serial.printf("Pairing code: %06lu\n",
+    Serial.printf("[PAIRING] code: %06lu\n",
                   static_cast<unsigned long>(passkey));
-    Serial.println("Type this code on the MX Keys Mini, then press Enter");
+    Serial.println("[PAIRING] type this code on the keyboard, then press Enter");
   }
 
   bool onSecurityRequest() override { return true; }
@@ -213,9 +286,9 @@ class KeyboardSecurityCallbacks : public BLESecurityCallbacks {
     authenticationFinished = true;
     if (result.success) {
       rememberBondedAddress(BLEAddress(result.bd_addr));
-      Serial.println("Keyboard paired and bonded");
+      Serial.println("[STATUS] keyboard paired and bonded");
     } else {
-      Serial.printf("Pairing failed (reason 0x%02x)\n", result.fail_reason);
+      Serial.printf("[STATUS] pairing failed (reason 0x%02x)\n", result.fail_reason);
     }
   }
 
@@ -260,10 +333,10 @@ bool connectToKeyboard() {
 
   authenticated = false;
   authenticationFinished = false;
-  Serial.printf("Connecting to %s...\n", keyboardAddress->toString().c_str());
+  Serial.printf("[STATUS] connecting to %s...\n", keyboardAddress->toString().c_str());
 
   if (!client->connect(*keyboardAddress, keyboardAddressType)) {
-    Serial.println("Connection failed");
+    Serial.println("[STATUS] connection failed");
     return false;
   }
 
@@ -295,13 +368,13 @@ bool connectToKeyboard() {
   }
 
   connected = true;
-  Serial.printf("Ready; listening to %u HID input report(s)\n",
+  Serial.printf("[STATUS] connected; listening to %u HID input report(s)\n",
                 static_cast<unsigned>(reportCount));
   return true;
 }
 
 void scanForKeyboard() {
-  Serial.printf("Scanning for %s...\n", kKeyboardName);
+  Serial.printf("[STATUS] searching for %s...\n", kKeyboardName);
   BLEScan *scan = BLEDevice::getScan();
   scan->setAdvertisedDeviceCallbacks(&advertisementCallbacks);
   scan->setActiveScan(true);
@@ -311,7 +384,8 @@ void scanForKeyboard() {
   scan->clearResults();
 
   if (!connectRequested) {
-    Serial.println("Not found. Put the keyboard in pairing mode; retrying...");
+    Serial.println("[STATUS] keyboard not found; retrying shortly");
+    Serial.println("[PAIRING] hold an Easy-Switch key until it blinks rapidly");
     nextScanAt = millis() + kRetryDelayMs;
   }
 }
@@ -327,7 +401,7 @@ void setup() {
     delay(10);
   }
   Serial.println();
-  Serial.println("MX Keys Mini firmware starting");
+  Serial.println("[STATUS] Bluetooth-to-KC85 adapter starting");
 
   pinMode(NEOPIXEL_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
@@ -353,7 +427,8 @@ void setup() {
   security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   loadBondedAddresses();
 
-  Serial.println("Select a Bluetooth slot and put the keyboard in pairing mode");
+  Serial.println("[PAIRING] select a Bluetooth slot and hold its Easy-Switch key");
+  Serial.println("[PAIRING] when a six-digit code appears, type it and press Enter");
 }
 
 void loop() {
