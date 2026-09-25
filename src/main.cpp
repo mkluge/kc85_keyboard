@@ -27,6 +27,7 @@ constexpr char kKeyboardNameMatch[] = "mx keys mini";
 constexpr uint32_t kScanSeconds = 5;
 constexpr uint32_t kRetryDelayMs = 1500;
 constexpr uint32_t kKeyFlashMs = 100;
+constexpr uint32_t kConsoleHeartbeatMs = 3000;
 constexpr uint8_t kLedBrightness = 24;
 constexpr uint8_t kKcDataPin = 1;
 constexpr uint8_t kKeyboardReportQueueLength = 16;
@@ -46,10 +47,29 @@ volatile bool authenticationFinished = false;
 
 uint32_t nextScanAt = 0;
 uint32_t ledOffAt = 0;
+uint32_t nextConsoleHeartbeatAt = 0;
+bool serialConsoleAttached = false;
 
 void setLed(bool on) {
   neopixelWrite(PIN_NEOPIXEL, on ? kLedBrightness : 0,
                 on ? kLedBrightness : 0, on ? kLedBrightness : 0);
+}
+
+void printConsoleBanner() {
+  Serial.println();
+  Serial.println("[STARTUP] Bluetooth-to-KC85 adapter is running");
+  Serial.println("[PAIRING] hold an MX Keys Mini Easy-Switch key until it blinks");
+  Serial.println("[PAIRING] type the displayed six-digit code and press Enter");
+}
+
+void printConsoleHeartbeat() {
+  if (connected) {
+    Serial.println("[STATUS] adapter running; keyboard connected");
+  } else if (connectRequested) {
+    Serial.println("[STATUS] adapter running; keyboard found, connection pending");
+  } else {
+    Serial.println("[STATUS] adapter running; searching for keyboard");
+  }
 }
 
 bool containsIgnoringCase(std::string value, const char *needle) {
@@ -400,8 +420,9 @@ void setup() {
   while (!Serial && static_cast<int32_t>(serialDeadline - millis()) > 0) {
     delay(10);
   }
-  Serial.println();
-  Serial.println("[STATUS] Bluetooth-to-KC85 adapter starting");
+  serialConsoleAttached = static_cast<bool>(Serial);
+  printConsoleBanner();
+  nextConsoleHeartbeatAt = millis() + 1000;
 
   pinMode(NEOPIXEL_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
@@ -432,6 +453,20 @@ void setup() {
 }
 
 void loop() {
+  const bool consoleAttached = static_cast<bool>(Serial);
+  if (consoleAttached && !serialConsoleAttached) {
+    printConsoleBanner();
+    printConsoleHeartbeat();
+    nextConsoleHeartbeatAt = millis() + kConsoleHeartbeatMs;
+  }
+  serialConsoleAttached = consoleAttached;
+
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - nextConsoleHeartbeatAt) >= 0) {
+    printConsoleHeartbeat();
+    nextConsoleHeartbeatAt = now + kConsoleHeartbeatMs;
+  }
+
   HidKeyboardReport report;
   if (keyboardReportQueue != nullptr &&
       xQueueReceive(keyboardReportQueue, &report, 0) == pdTRUE) {
