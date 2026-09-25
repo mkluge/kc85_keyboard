@@ -29,7 +29,7 @@ constexpr uint32_t kRetryDelayMs = 1500;
 constexpr uint32_t kKeyFlashMs = 100;
 constexpr uint32_t kConsoleHeartbeatMs = 3000;
 constexpr uint8_t kLedBrightness = 24;
-constexpr uint8_t kKcDataPin = 1;
+constexpr uint8_t kKcDataPin = A0;
 constexpr uint8_t kKeyboardReportQueueLength = 16;
 constexpr uint8_t kShiftModifierMask = 0x22;
 
