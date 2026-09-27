@@ -3,7 +3,7 @@
 #include "kc85_keyboard.h"
 
 // GPIO connected to the input of the external inverting output transistor.
-constexpr uint8_t KCDATA_PIN = 1;
+constexpr uint8_t KCDATA_PIN = A0;
 
 // Time between the scheduled starts of complete test-key sequences.
 constexpr uint32_t TEST_INTERVAL_MS = 5000;
