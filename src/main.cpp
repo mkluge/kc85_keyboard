@@ -22,6 +22,7 @@ namespace {
 constexpr uint16_t kHidServiceUuid = 0x1812;
 constexpr uint16_t kReportUuid = 0x2A4D;
 constexpr uint16_t kBootKeyboardInputUuid = 0x2A22;
+constexpr uint16_t kProtocolModeUuid = 0x2A4E;
 constexpr char kKeyboardName[] = "MX Keys Mini";
 constexpr char kKeyboardNameMatch[] = "mx keys mini";
 constexpr uint32_t kScanSeconds = 5;
@@ -31,7 +32,15 @@ constexpr uint32_t kConsoleHeartbeatMs = 3000;
 constexpr uint8_t kLedBrightness = 24;
 constexpr uint8_t kKcDataPin = A0;
 constexpr uint8_t kKeyboardReportQueueLength = 16;
+constexpr size_t kMaxQueuedHidReportLength = 32;
 constexpr uint8_t kShiftModifierMask = 0x22;
+
+struct QueuedHidReport {
+  uint16_t characteristicHandle;
+  uint16_t receivedLength;
+  uint8_t storedLength;
+  uint8_t data[kMaxQueuedHidReportLength];
+};
 
 BLEClient *client = nullptr;
 BLEAddress *keyboardAddress = nullptr;
@@ -109,30 +118,33 @@ void loadBondedAddresses() {
                 static_cast<unsigned>(bondedAddresses.size()));
 }
 
-void enqueueKeyboardReport(const HidKeyboardReport &report) {
+void enqueueHidReport(uint16_t characteristicHandle, const uint8_t *data,
+                      size_t length) {
   if (keyboardReportQueue == nullptr) {
     return;
   }
 
+  QueuedHidReport report{};
+  report.characteristicHandle = characteristicHandle;
+  report.receivedLength = static_cast<uint16_t>(
+      std::min(length, static_cast<size_t>(UINT16_MAX)));
+  report.storedLength = static_cast<uint8_t>(
+      std::min(length, static_cast<size_t>(kMaxQueuedHidReportLength)));
+  if (report.storedLength != 0) {
+    std::memcpy(report.data, data, report.storedLength);
+  }
+
   if (xQueueSend(keyboardReportQueue, &report, 0) != pdTRUE) {
     // Retain the most recent transitions if an unusual burst fills the queue.
-    HidKeyboardReport discarded;
+    QueuedHidReport discarded;
     xQueueReceive(keyboardReportQueue, &discarded, 0);
     xQueueSend(keyboardReportQueue, &report, 0);
   }
 }
 
-void onHidReport(BLERemoteCharacteristic *, uint8_t *data, size_t length,
-                 bool) {
-  // Keyboard input reports use the standard boot-keyboard shape. Other
-  // notifiable HID reports (consumer/media controls, for example) are ignored.
-  if (length != sizeof(HidKeyboardReport)) {
-    return;
-  }
-
-  HidKeyboardReport report;
-  std::memcpy(&report, data, sizeof(report));
-  enqueueKeyboardReport(report);
+void onHidReport(BLERemoteCharacteristic *characteristic, uint8_t *data,
+                 size_t length, bool) {
+  enqueueHidReport(characteristic->getHandle(), data, length);
 }
 
 bool reportHasPressedKey(const HidKeyboardReport &report) {
@@ -207,6 +219,18 @@ void printKeyboardReport(const HidKeyboardReport &report) {
   Serial.println("]");
 }
 
+void printRawHidReport(const QueuedHidReport &report) {
+  Serial.printf("[HID] handle=0x%04X length=%u data=",
+                report.characteristicHandle, report.receivedLength);
+  for (uint8_t i = 0; i < report.storedLength; ++i) {
+    Serial.printf("%s%02X", i == 0 ? "" : " ", report.data[i]);
+  }
+  if (report.receivedLength > report.storedLength) {
+    Serial.print(" ... (truncated)");
+  }
+  Serial.println();
+}
+
 void applyKeyboardReport(const HidKeyboardReport &report) {
   printKeyboardReport(report);
   if (reportHasPressedKey(report)) {
@@ -235,6 +259,21 @@ void applyKeyboardReport(const HidKeyboardReport &report) {
   Serial.println(reportHasPressedKey(report)
                      ? "[KEY] no supported KC85 key in report"
                      : "[KEY] all keys released");
+}
+
+void processHidReport(const QueuedHidReport &queuedReport) {
+  // Always expose notifications on the serial console. This makes report-map
+  // mismatches diagnosable instead of silently dropping all keyboard input.
+  printRawHidReport(queuedReport);
+
+  if (queuedReport.receivedLength != sizeof(HidKeyboardReport)) {
+    Serial.println("[HID] unsupported report shape; expected 8-byte boot report");
+    return;
+  }
+
+  HidKeyboardReport keyboardReport;
+  std::memcpy(&keyboardReport, queuedReport.data, sizeof(keyboardReport));
+  applyKeyboardReport(keyboardReport);
 }
 
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -281,7 +320,9 @@ class KeyboardClientCallbacks : public BLEClientCallbacks {
     authenticated = false;
     authenticationFinished = false;
     nextScanAt = millis() + kRetryDelayMs;
-    enqueueKeyboardReport(HidKeyboardReport{});
+    const HidKeyboardReport released{};
+    enqueueHidReport(0, reinterpret_cast<const uint8_t *>(&released),
+                     sizeof(released));
     Serial.println("[STATUS] keyboard disconnected; scanning will resume");
   }
 };
@@ -334,11 +375,42 @@ size_t subscribeToInputReports(BLERemoteService *hidService) {
     const bool isInputReport = uuid.equals(BLEUUID(kReportUuid)) ||
                                uuid.equals(BLEUUID(kBootKeyboardInputUuid));
     if (isInputReport && characteristic->canNotify()) {
+      Serial.printf("[HID] subscribing handle=0x%04X uuid=%s\n",
+                    characteristic->getHandle(), uuid.toString().c_str());
       characteristic->registerForNotify(onHidReport);
       ++subscribed;
     }
   }
   return subscribed;
+}
+
+bool requestBootProtocol(BLERemoteService *hidService) {
+  BLERemoteCharacteristic *protocolMode = nullptr;
+  bool hasBootKeyboardInput = false;
+  auto *characteristics = hidService->getCharacteristicsByHandle();
+
+  for (const auto &entry : *characteristics) {
+    BLERemoteCharacteristic *characteristic = entry.second;
+    BLEUUID uuid = characteristic->getUUID();
+    if (uuid.equals(BLEUUID(kProtocolModeUuid))) {
+      protocolMode = characteristic;
+    } else if (uuid.equals(BLEUUID(kBootKeyboardInputUuid)) &&
+               characteristic->canNotify()) {
+      hasBootKeyboardInput = true;
+    }
+  }
+
+  if (!hasBootKeyboardInput || protocolMode == nullptr ||
+      (!protocolMode->canWrite() && !protocolMode->canWriteNoResponse())) {
+    Serial.println("[HID] boot protocol unavailable; using report protocol");
+    return false;
+  }
+
+  constexpr uint8_t kBootProtocol = 0;
+  const bool useWriteResponse = protocolMode->canWrite();
+  protocolMode->writeValue(kBootProtocol, useWriteResponse);
+  Serial.println("[HID] boot protocol selected (8-byte keyboard reports)");
+  return true;
 }
 
 bool connectToKeyboard() {
@@ -380,6 +452,7 @@ bool connectToKeyboard() {
     return false;
   }
 
+  requestBootProtocol(hidService);
   const size_t reportCount = subscribeToInputReports(hidService);
   if (reportCount == 0) {
     Serial.println("No notifiable keyboard input reports found");
@@ -430,7 +503,7 @@ void setup() {
 
   kcKeyboard.begin();
   keyboardReportQueue =
-      xQueueCreate(kKeyboardReportQueueLength, sizeof(HidKeyboardReport));
+      xQueueCreate(kKeyboardReportQueueLength, sizeof(QueuedHidReport));
   if (keyboardReportQueue == nullptr) {
     Serial.println("Could not allocate the HID keyboard report queue");
   }
@@ -467,10 +540,10 @@ void loop() {
     nextConsoleHeartbeatAt = now + kConsoleHeartbeatMs;
   }
 
-  HidKeyboardReport report;
+  QueuedHidReport report;
   if (keyboardReportQueue != nullptr &&
       xQueueReceive(keyboardReportQueue, &report, 0) == pdTRUE) {
-    applyKeyboardReport(report);
+    processHidReport(report);
   }
   kcKeyboard.service();
 
