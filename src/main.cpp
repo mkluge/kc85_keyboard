@@ -6,6 +6,7 @@
 #include <BLERemoteService.h>
 #include <BLEScan.h>
 #include <BLESecurity.h>
+#include <esp32-hal-tinyusb.h>
 
 #include <algorithm>
 #include <cctype>
@@ -23,6 +24,7 @@ constexpr uint32_t kScanSeconds = 5;
 constexpr uint32_t kRetryDelayMs = 1500;
 constexpr uint32_t kKeyFlashMs = 100;
 constexpr uint8_t kLedBrightness = 24;
+constexpr char kBootloaderCommand[] = "PIO_ENTER_BOOTLOADER\n";
 
 BLEClient *client = nullptr;
 BLEAddress *keyboardAddress = nullptr;
@@ -37,6 +39,24 @@ volatile bool keyEventPending = false;
 
 uint32_t nextScanAt = 0;
 uint32_t ledOffAt = 0;
+size_t bootloaderCommandIndex = 0;
+
+void checkForBootloaderCommand() {
+  while (Serial.available()) {
+    const char received = static_cast<char>(Serial.read());
+    if (received == kBootloaderCommand[bootloaderCommandIndex]) {
+      ++bootloaderCommandIndex;
+      if (bootloaderCommandIndex == sizeof(kBootloaderCommand) - 1) {
+        Serial.println("Entering ROM download mode...");
+        Serial.flush();
+        delay(100);
+        usb_persist_restart(RESTART_BOOTLOADER);
+      }
+    } else {
+      bootloaderCommandIndex = received == kBootloaderCommand[0] ? 1 : 0;
+    }
+  }
+}
 
 void setLed(bool on) {
   neopixelWrite(PIN_NEOPIXEL, on ? kLedBrightness : 0,
@@ -296,6 +316,8 @@ void setup() {
 }
 
 void loop() {
+  checkForBootloaderCommand();
+
   if (keyEventPending) {
     keyEventPending = false;
     setLed(true);
