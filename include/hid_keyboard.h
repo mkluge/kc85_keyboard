@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-// Standard eight-byte HID boot-keyboard report.
+// Normalized keyboard state used internally after decoding a HID input report.
 struct HidKeyboardReport
 {
   uint8_t modifiers;

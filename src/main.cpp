@@ -11,17 +11,19 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstring>
 #include <string>
 #include <vector>
 
 #include "hid_keyboard.h"
+#include "hid_report_map.h"
 #include "kc85_keyboard.h"
 
 namespace {
 constexpr uint16_t kHidServiceUuid = 0x1812;
 constexpr uint16_t kReportUuid = 0x2A4D;
-constexpr uint16_t kBootKeyboardInputUuid = 0x2A22;
+constexpr uint16_t kReportMapUuid = 0x2A4B;
+constexpr uint16_t kReportReferenceUuid = 0x2908;
+constexpr uint8_t kInputReportType = 0x01;
 constexpr char kKeyboardName[] = "MX Keys Mini";
 constexpr char kKeyboardNameMatch[] = "mx keys mini";
 constexpr uint32_t kScanSeconds = 5;
@@ -39,6 +41,13 @@ esp_ble_addr_type_t keyboardAddressType = BLE_ADDR_TYPE_PUBLIC;
 std::vector<BLEAddress> bondedAddresses;
 QueueHandle_t keyboardReportQueue = nullptr;
 Kc85Keyboard kcKeyboard(kKcDataPin);
+HidReportMap hidReportMap;
+
+struct KeyboardInputSubscription {
+  BLERemoteCharacteristic *characteristic;
+  uint8_t reportId;
+};
+std::vector<KeyboardInputSubscription> keyboardInputSubscriptions;
 
 volatile bool connectRequested = false;
 volatile bool connected = false;
@@ -122,16 +131,24 @@ void enqueueKeyboardReport(const HidKeyboardReport &report) {
   }
 }
 
-void onHidReport(BLERemoteCharacteristic *, uint8_t *data, size_t length,
-                 bool) {
-  // Keyboard input reports use the standard boot-keyboard shape. Other
-  // notifiable HID reports (consumer/media controls, for example) are ignored.
-  if (length != sizeof(HidKeyboardReport)) {
+void onHidReport(BLERemoteCharacteristic *characteristic, uint8_t *data,
+                 size_t length, bool) {
+  const auto subscription = std::find_if(
+      keyboardInputSubscriptions.begin(), keyboardInputSubscriptions.end(),
+      [characteristic](const KeyboardInputSubscription &candidate) {
+        return candidate.characteristic == characteristic;
+      });
+  if (subscription == keyboardInputSubscriptions.end()) {
     return;
   }
 
   HidKeyboardReport report;
-  std::memcpy(&report, data, sizeof(report));
+  if (!hidReportMap.decodeKeyboardInput(subscription->reportId, data, length,
+                                        report)) {
+    Serial.printf("[DEBUG] could not decode HID report %u (%u bytes)\n",
+                  subscription->reportId, static_cast<unsigned>(length));
+    return;
+  }
   enqueueKeyboardReport(report);
 }
 
@@ -191,8 +208,9 @@ void printHidUsage(uint8_t usage) {
   }
 }
 
-void printKeyboardReport(const HidKeyboardReport &report) {
-  Serial.printf("[KEY] modifiers=0x%02X keys=[", report.modifiers);
+void printPressedKeyboardReport(const HidKeyboardReport &report) {
+  Serial.printf("[DEBUG] BT keyboard key pressed: modifiers=0x%02X keys=[",
+                report.modifiers);
   bool first = true;
   for (uint8_t usage : report.keys) {
     if (usage == 0) {
@@ -208,8 +226,8 @@ void printKeyboardReport(const HidKeyboardReport &report) {
 }
 
 void applyKeyboardReport(const HidKeyboardReport &report) {
-  printKeyboardReport(report);
   if (reportHasPressedKey(report)) {
+    printPressedKeyboardReport(report);
     setLed(true);
     ledOffAt = millis() + kKeyFlashMs;
   }
@@ -325,18 +343,56 @@ KeyboardSecurityCallbacks securityCallbacks;
 BLESecurity security;
 
 size_t subscribeToInputReports(BLERemoteService *hidService) {
+  keyboardInputSubscriptions.clear();
+
+  BLERemoteCharacteristic *reportMapCharacteristic =
+      hidService->getCharacteristic(BLEUUID(kReportMapUuid));
+  if (reportMapCharacteristic == nullptr || !reportMapCharacteristic->canRead()) {
+    Serial.println("HID service has no readable Report Map");
+    return 0;
+  }
+
+  const std::string reportMapValue = reportMapCharacteristic->readValue();
+  if (!hidReportMap.parse(
+          reinterpret_cast<const uint8_t *>(reportMapValue.data()),
+          reportMapValue.size())) {
+    Serial.println("Could not parse keyboard fields from HID Report Map");
+    return 0;
+  }
+  Serial.printf("[STATUS] parsed HID Report Map (%u bytes)\n",
+                static_cast<unsigned>(reportMapValue.size()));
+
   size_t subscribed = 0;
   auto *characteristics = hidService->getCharacteristicsByHandle();
 
   for (const auto &entry : *characteristics) {
     BLERemoteCharacteristic *characteristic = entry.second;
-    BLEUUID uuid = characteristic->getUUID();
-    const bool isInputReport = uuid.equals(BLEUUID(kReportUuid)) ||
-                               uuid.equals(BLEUUID(kBootKeyboardInputUuid));
-    if (isInputReport && characteristic->canNotify()) {
-      characteristic->registerForNotify(onHidReport);
-      ++subscribed;
+    if (!characteristic->getUUID().equals(BLEUUID(kReportUuid)) ||
+        !characteristic->canNotify()) {
+      continue;
     }
+
+    BLERemoteDescriptor *reportReference =
+        characteristic->getDescriptor(BLEUUID(kReportReferenceUuid));
+    if (reportReference == nullptr) {
+      continue;
+    }
+
+    const std::string referenceValue = reportReference->readValue();
+    if (referenceValue.size() < 2 ||
+        static_cast<uint8_t>(referenceValue[1]) != kInputReportType) {
+      continue;
+    }
+
+    const uint8_t reportId = static_cast<uint8_t>(referenceValue[0]);
+    if (!hidReportMap.hasKeyboardInput(reportId)) {
+      continue;
+    }
+
+    keyboardInputSubscriptions.push_back({characteristic, reportId});
+    characteristic->registerForNotify(onHidReport);
+    Serial.printf("[STATUS] subscribed to keyboard HID report %u\n", reportId);
+    ++subscribed;
   }
   return subscribed;
 }

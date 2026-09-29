@@ -26,10 +26,11 @@ address on later reconnections, even when it no longer advertises its name.
 
 ## Key translation
 
-The adapter handles the standard eight-byte HID boot-keyboard report and uses
-the USB HID US logical layout. Letters, digits, KC85-supported punctuation,
-Enter, Space, Backspace, Tab, Caps Lock, F1-F12, Insert, Home, Delete, arrow
-keys, Escape/Pause (BREAK), and keypad digits/operators are translated.
+The adapter reads the keyboard's HID Report Map and supports both key-code
+arrays and one-bit-per-key (NKRO) input reports. It uses the USB HID US logical
+layout. Letters, digits, KC85-supported punctuation, Enter, Space, Backspace,
+Tab, Caps Lock, F1-F12, Insert, Home, Delete, arrow keys, Escape/Pause (BREAK),
+and keypad digits/operators are translated.
 Left/Right Shift select uppercase letters and shifted symbols. Ctrl, Alt,
 GUI, media keys, and characters unavailable on the KC85 are not forwarded.
 When several normal keys are held, the first supported key in the report is
