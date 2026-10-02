@@ -91,8 +91,9 @@ public:
 
   void begin();
 
-  // Call service() continuously from loop(). Transmission of one word is
-  // synchronous, because its seven burst spacings are timing-critical.
+  // Call service() continuously from the task that owns this object.
+  // Transmission of one word is synchronous: its spacings are timing-critical.
+  // All state-changing methods must also be called from that same task.
   void service();
 
   // SHIFT is an electrical plane selector in the original keyboard, not a

@@ -1,5 +1,8 @@
 #include "hid_keyboard.h"
 
+#include <algorithm>
+#include <iterator>
+
 namespace
 {
 constexpr char UnshiftedDigits[] = "1234567890";
@@ -21,6 +24,26 @@ constexpr PrintablePair PrintableKeys[] = {
     {0x38, '/', '?'}, {0x64, '\\', 0},
 };
 } // namespace
+
+void mergeKeyboardReport(HidKeyboardReport &aggregate,
+                         const HidKeyboardReport &report)
+{
+  aggregate.modifiers |= report.modifiers;
+  for (uint8_t usage : report.keys)
+  {
+    if (usage == 0 ||
+        std::find(std::begin(aggregate.keys), std::end(aggregate.keys), usage) !=
+            std::end(aggregate.keys))
+    {
+      continue;
+    }
+    auto empty = std::find(std::begin(aggregate.keys), std::end(aggregate.keys), 0);
+    if (empty != std::end(aggregate.keys))
+    {
+      *empty = usage;
+    }
+  }
+}
 
 bool hidUsageToIso7(uint8_t usage, bool shifted, uint8_t &iso7Code)
 {
