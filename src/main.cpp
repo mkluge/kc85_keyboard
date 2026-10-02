@@ -6,17 +6,21 @@
 #include <BLERemoteService.h>
 #include <BLEScan.h>
 #include <BLESecurity.h>
+#include <Preferences.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "hid_keyboard.h"
 #include "hid_report_map.h"
 #include "kc85_keyboard.h"
+#include "kc85_output.h"
 
 namespace {
 constexpr uint16_t kHidServiceUuid = 0x1812;
@@ -32,27 +36,86 @@ constexpr uint32_t kKeyFlashMs = 100;
 constexpr uint32_t kConsoleHeartbeatMs = 3000;
 constexpr uint8_t kLedBrightness = 24;
 constexpr uint8_t kKcDataPin = A0;
-constexpr uint8_t kKeyboardReportQueueLength = 16;
+constexpr size_t kMaxInputReports = 16;
+constexpr size_t kMaxReportBytes = 512;
+constexpr uint32_t kAuthenticationTimeoutMs = 15000;
+constexpr uint16_t kKeyboardAppearance = 0x03C1;
 constexpr uint8_t kShiftModifierMask = 0x22;
 
 BLEClient *client = nullptr;
-BLEAddress *keyboardAddress = nullptr;
+BLEAddress keyboardAddress("00:00:00:00:00:00");
 esp_ble_addr_type_t keyboardAddressType = BLE_ADDR_TYPE_PUBLIC;
-std::vector<BLEAddress> bondedAddresses;
-QueueHandle_t keyboardReportQueue = nullptr;
-Kc85Keyboard kcKeyboard(kKcDataPin);
+std::vector<esp_ble_bond_dev_t> bondedDevices;
+Preferences preferences;
+Kc85Output kcOutput(kKcDataPin);
 HidReportMap hidReportMap;
 
+// Callbacks copy data into queues. Only loop() owns connection state, the
+// report map, subscriptions and bonds. Kc85Output owns the transmitter.
+enum class BleEventType { Authentication, Disconnected, Passkey, RejectPairing,
+                          NotificationRegistration };
+struct BleEvent {
+  explicit BleEvent(BleEventType eventType = BleEventType::Disconnected)
+      : type(eventType) {}
+  BleEventType type;
+  esp_ble_auth_cmpl_t authentication{};
+  uint32_t passkey = 0;
+  uint16_t handle = 0;
+  esp_gatt_status_t status = ESP_GATT_ERROR;
+  esp_bd_addr_t address{};
+  bool numericComparison = false;
+};
+struct AdvertisementCandidate {
+  esp_bd_addr_t address;
+  esp_ble_addr_type_t addressType;
+  bool matchesName;
+  bool advertisesHid;
+  bool keyboardAppearance;
+};
+struct RawInputReport {
+  uint32_t generation;
+  size_t length;
+  uint8_t data[kMaxReportBytes];
+};
+QueueHandle_t bleEventQueue = nullptr;
+QueueHandle_t candidateQueue = nullptr;
+QueueHandle_t inputMailboxes[kMaxInputReports]{};
+std::atomic<bool> bleEventOverflow{false};
+uint32_t connectionGeneration = 0;
+
 struct KeyboardInputSubscription {
+  KeyboardInputSubscription(BLERemoteCharacteristic *input, uint8_t id,
+                            QueueHandle_t queue)
+      : characteristic(input), reportId(id), mailbox(queue) {}
   BLERemoteCharacteristic *characteristic;
   uint8_t reportId;
+  QueueHandle_t mailbox;
+  HidKeyboardReport state{};
+  bool registered = false;
 };
 std::vector<KeyboardInputSubscription> keyboardInputSubscriptions;
 
-volatile bool connectRequested = false;
-volatile bool connected = false;
-volatile bool authenticated = false;
-volatile bool authenticationFinished = false;
+bool connectRequested = false;
+bool connected = false;
+bool authenticated = false;
+bool authenticationFinished = false;
+bool pairingRejected = false;
+bool linkDisconnected = false;
+esp_ble_auth_cmpl_t authenticatedPeer{};
+
+bool deadlineReached(uint32_t now, uint32_t deadline) {
+  return static_cast<int32_t>(now - deadline) >= 0;
+}
+
+void queueBleEvent(const BleEvent &event) {
+  if (xQueueSend(bleEventQueue, &event, 0) != pdTRUE) {
+    bleEventOverflow.store(true);
+  }
+}
+
+void releaseOutput() {
+  kcOutput.release();
+}
 
 uint32_t nextScanAt = 0;
 uint32_t ledOffAt = 0;
@@ -88,17 +151,18 @@ bool containsIgnoringCase(std::string value, const char *needle) {
 }
 
 bool isBondedAddress(const BLEAddress &address) {
-  return std::find(bondedAddresses.begin(), bondedAddresses.end(), address) !=
-         bondedAddresses.end();
-}
-
-void rememberBondedAddress(const BLEAddress &address) {
-  if (!isBondedAddress(address)) {
-    bondedAddresses.push_back(address);
+  for (const auto &device : bondedDevices) {
+    if (BLEAddress(const_cast<uint8_t *>(device.bd_addr)) == address ||
+        ((device.bond_key.key_mask & ESP_BLE_ID_KEY_MASK) != 0 &&
+         BLEAddress(const_cast<uint8_t *>(device.bond_key.pid_key.static_addr)) == address)) {
+      return true;
+    }
   }
+  return false;
 }
 
 void loadBondedAddresses() {
+  bondedDevices.clear();
   int count = esp_ble_get_bond_device_num();
   if (count <= 0) {
     Serial.println("No stored keyboard bond; initial pairing is required");
@@ -111,45 +175,27 @@ void loadBondedAddresses() {
     return;
   }
 
-  for (int i = 0; i < count; ++i) {
-    rememberBondedAddress(BLEAddress(devices[i].bd_addr));
-  }
+  devices.resize(count);
+  bondedDevices = std::move(devices);
   Serial.printf("Loaded %u stored BLE bond(s) for automatic reconnection\n",
-                static_cast<unsigned>(bondedAddresses.size()));
+                static_cast<unsigned>(bondedDevices.size()));
 }
 
-void enqueueKeyboardReport(const HidKeyboardReport &report) {
-  if (keyboardReportQueue == nullptr) {
-    return;
+void rememberPreferredIdentity(const esp_ble_auth_cmpl_t &result) {
+  // Store identity metadata, never the bonding keys. Bluedroid owns its IRKs
+  // and resolves private addresses when the current advertisement is used.
+  const uint8_t *identity = result.bd_addr;
+  esp_ble_addr_type_t type = result.addr_type;
+  for (const auto &device : bondedDevices) {
+    if (std::memcmp(device.bd_addr, result.bd_addr, sizeof(esp_bd_addr_t)) == 0 &&
+        (device.bond_key.key_mask & ESP_BLE_ID_KEY_MASK) != 0) {
+      identity = device.bond_key.pid_key.static_addr;
+      type = device.bond_key.pid_key.addr_type;
+      break;
+    }
   }
-
-  if (xQueueSend(keyboardReportQueue, &report, 0) != pdTRUE) {
-    // Retain the most recent transitions if an unusual burst fills the queue.
-    HidKeyboardReport discarded;
-    xQueueReceive(keyboardReportQueue, &discarded, 0);
-    xQueueSend(keyboardReportQueue, &report, 0);
-  }
-}
-
-void onHidReport(BLERemoteCharacteristic *characteristic, uint8_t *data,
-                 size_t length, bool) {
-  const auto subscription = std::find_if(
-      keyboardInputSubscriptions.begin(), keyboardInputSubscriptions.end(),
-      [characteristic](const KeyboardInputSubscription &candidate) {
-        return candidate.characteristic == characteristic;
-      });
-  if (subscription == keyboardInputSubscriptions.end()) {
-    return;
-  }
-
-  HidKeyboardReport report;
-  if (!hidReportMap.decodeKeyboardInput(subscription->reportId, data, length,
-                                        report)) {
-    Serial.printf("[DEBUG] could not decode HID report %u (%u bytes)\n",
-                  subscription->reportId, static_cast<unsigned>(length));
-    return;
-  }
-  enqueueKeyboardReport(report);
+  preferences.putBytes("identity", identity, sizeof(esp_bd_addr_t));
+  preferences.putUChar("addr-type", static_cast<uint8_t>(type));
 }
 
 bool reportHasPressedKey(const HidKeyboardReport &report) {
@@ -235,11 +281,11 @@ void applyKeyboardReport(const HidKeyboardReport &report) {
   const bool shifted = (report.modifiers & kShiftModifierMask) != 0;
   for (uint8_t usage : report.keys) {
     uint8_t iso7Code;
+    KcKey kcKey;
+    bool kcShifted;
     if (usage != 0 && hidUsageToIso7(usage, shifted, iso7Code) &&
-        kcKeyboard.pressIso7(iso7Code)) {
-      KcKey kcKey;
-      bool kcShifted;
-      Kc85Keyboard::keyForIso7(iso7Code, kcKey, kcShifted);
+        Kc85Keyboard::keyForIso7(iso7Code, kcKey, kcShifted)) {
+      kcOutput.press(kcKey, kcShifted);
       Serial.printf("[KEY] HID 0x%02X -> ISO-7 0x%02X -> KC85 IBUS 0x%02X",
                     usage, iso7Code,
                     Kc85Keyboard::ibusForKey(kcKey, kcShifted));
@@ -249,7 +295,7 @@ void applyKeyboardReport(const HidKeyboardReport &report) {
   }
 
   // A release, modifier-only report, or unsupported key stops KC85 repeats.
-  kcKeyboard.releaseKey();
+  releaseOutput();
   Serial.println(reportHasPressedKey(report)
                      ? "[KEY] no supported KC85 key in report"
                      : "[KEY] all keys released");
@@ -258,89 +304,133 @@ void applyKeyboardReport(const HidKeyboardReport &report) {
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
  public:
   void onResult(BLEAdvertisedDevice device) override {
-    const BLEAddress advertisedAddress = device.getAddress();
-    const bool namedMxKeysMini =
+    AdvertisementCandidate candidate{};
+    std::memcpy(candidate.address, device.getAddress().getNative(),
+                sizeof(candidate.address));
+    candidate.addressType = device.getAddressType();
+    candidate.matchesName =
         device.haveName() &&
         containsIgnoringCase(device.getName(), kKeyboardNameMatch);
-    const bool knownBond = isBondedAddress(advertisedAddress);
-    const bool advertisesHid =
+    candidate.advertisesHid =
         device.haveServiceUUID() &&
         device.isAdvertisingService(BLEUUID(kHidServiceUuid));
 
-    Serial.printf("  %s | %s | RSSI %d dBm%s\n",
-                  device.haveName() ? device.getName().c_str() : "<unnamed>",
-                  device.getAddress().toString().c_str(),
-                  device.haveRSSI() ? device.getRSSI() : -999,
-                  advertisesHid ? " | HID" : "");
-
-    if (!namedMxKeysMini && !knownBond) {
-      return;
-    }
-
-    Serial.println(knownBond ? "[STATUS] bonded keyboard found; reconnecting"
-                             : "[STATUS] MX Keys Mini found; pairing required");
-
-    delete keyboardAddress;
-    keyboardAddress = new BLEAddress(advertisedAddress);
-    keyboardAddressType = device.getAddressType();
-    connectRequested = true;
-    BLEDevice::getScan()->stop();
+    candidate.keyboardAppearance =
+        device.haveAppearance() && device.getAppearance() == kKeyboardAppearance;
+    xQueueSend(candidateQueue, &candidate, 0);
   }
 };
 
 class KeyboardClientCallbacks : public BLEClientCallbacks {
  public:
-  void onConnect(BLEClient *) override {
-    Serial.println("[STATUS] BLE link connected; authenticating");
-  }
+  void onConnect(BLEClient *) override {}
 
   void onDisconnect(BLEClient *) override {
-    connected = false;
-    authenticated = false;
-    authenticationFinished = false;
-    nextScanAt = millis() + kRetryDelayMs;
-    enqueueKeyboardReport(HidKeyboardReport{});
-    Serial.println("[STATUS] keyboard disconnected; scanning will resume");
+    queueBleEvent(BleEvent{BleEventType::Disconnected});
   }
 };
 
-class KeyboardSecurityCallbacks : public BLESecurityCallbacks {
- public:
-  uint32_t onPassKeyRequest() override {
-    Serial.println("[PAIRING] keyboard requested a passkey from the ESP32");
-    return 0;
+// The Arduino passkey-request callback always sends an affirmative reply.
+// Use the raw GAP hook so the owner task can explicitly reject that path.
+void onGapEvent(esp_gap_ble_cb_event_t type, esp_ble_gap_cb_param_t *parameters) {
+  BleEvent event{};
+  switch (type) {
+    case ESP_GAP_BLE_AUTH_CMPL_EVT:
+      event.type = BleEventType::Authentication;
+      event.authentication = parameters->ble_security.auth_cmpl;
+      break;
+    case ESP_GAP_BLE_PASSKEY_NOTIF_EVT:
+      event.type = BleEventType::Passkey;
+      event.passkey = parameters->ble_security.key_notif.passkey;
+      break;
+    case ESP_GAP_BLE_PASSKEY_REQ_EVT:
+    case ESP_GAP_BLE_NC_REQ_EVT:
+      event.type = BleEventType::RejectPairing;
+      event.numericComparison = type == ESP_GAP_BLE_NC_REQ_EVT;
+      std::memcpy(event.address, parameters->ble_security.ble_req.bd_addr,
+                  sizeof(event.address));
+      break;
+    default:
+      return;
   }
+  queueBleEvent(event);
+}
 
-  void onPassKeyNotify(uint32_t passkey) override {
-    Serial.printf("[PAIRING] code: %06lu\n",
-                  static_cast<unsigned long>(passkey));
-    Serial.println("[PAIRING] type this code on the keyboard, then press Enter");
+void onGattEvent(esp_gattc_cb_event_t type, esp_gatt_if_t,
+                 esp_ble_gattc_cb_param_t *parameters) {
+  if (type == ESP_GATTC_REG_FOR_NOTIFY_EVT) {
+    BleEvent event{BleEventType::NotificationRegistration};
+    event.handle = parameters->reg_for_notify.handle;
+    event.status = parameters->reg_for_notify.status;
+    queueBleEvent(event);
   }
-
-  bool onSecurityRequest() override { return true; }
-
-  void onAuthenticationComplete(esp_ble_auth_cmpl_t result) override {
-    authenticated = result.success;
-    authenticationFinished = true;
-    if (result.success) {
-      rememberBondedAddress(BLEAddress(result.bd_addr));
-      Serial.println("[STATUS] keyboard paired and bonded");
-    } else {
-      Serial.printf("[STATUS] pairing failed (reason 0x%02x)\n", result.fail_reason);
-    }
-  }
-
-  bool onConfirmPIN(uint32_t pin) override {
-    Serial.printf("Confirming pairing code %06lu\n",
-                  static_cast<unsigned long>(pin));
-    return true;
-  }
-};
+}
 
 KeyboardAdvertisementCallbacks advertisementCallbacks;
 KeyboardClientCallbacks clientCallbacks;
-KeyboardSecurityCallbacks securityCallbacks;
 BLESecurity security;
+
+void processBleEvents() {
+  BleEvent event;
+  while (xQueueReceive(bleEventQueue, &event, 0) == pdTRUE) {
+    switch (event.type) {
+      case BleEventType::Disconnected:
+        connected = false;
+        authenticated = false;
+        linkDisconnected = true;
+        keyboardInputSubscriptions.clear();
+        releaseOutput();
+        nextScanAt = millis() + kRetryDelayMs;
+        Serial.println("[STATUS] keyboard disconnected; scanning will resume");
+        break;
+      case BleEventType::Authentication: {
+        if (linkDisconnected || client == nullptr || !client->isConnected()) {
+          break;
+        }
+        const auto &result = event.authentication;
+        authenticationFinished = true;
+        authenticated = result.success &&
+            (result.auth_mode & ESP_LE_AUTH_REQ_SC_MITM_BOND) ==
+                ESP_LE_AUTH_REQ_SC_MITM_BOND;
+        if (authenticated) {
+          authenticatedPeer = result;
+          loadBondedAddresses();
+          Serial.println("[STATUS] keyboard authenticated and bonded");
+        } else {
+          pairingRejected = true;
+          Serial.printf("[STATUS] authentication rejected (reason 0x%02x, mode 0x%02x)\n",
+                        result.fail_reason, result.auth_mode);
+        }
+        break;
+      }
+      case BleEventType::Passkey:
+        Serial.printf("[PAIRING] code: %06lu; type it on the keyboard and press Enter\n",
+                      static_cast<unsigned long>(event.passkey));
+        break;
+      case BleEventType::RejectPairing:
+        if (event.numericComparison) {
+          esp_ble_confirm_reply(event.address, false);
+        } else {
+          esp_ble_passkey_reply(event.address, false, 0);
+        }
+        pairingRejected = true;
+        Serial.println("[PAIRING] rejected unexpected pairing path for display-only host");
+        break;
+      case BleEventType::NotificationRegistration:
+        for (auto &subscription : keyboardInputSubscriptions) {
+          if (subscription.characteristic->getHandle() == event.handle) {
+            subscription.registered = event.status == ESP_GATT_OK;
+          }
+        }
+        break;
+    }
+  }
+  // Dropping a security/disconnect event cannot leave a keyboard ready.
+  if (bleEventOverflow.exchange(false)) {
+    pairingRejected = true;
+    Serial.println("[STATUS] BLE event queue overflow; reconnecting");
+  }
+}
 
 size_t subscribeToInputReports(BLERemoteService *hidService) {
   keyboardInputSubscriptions.clear();
@@ -389,8 +479,50 @@ size_t subscribeToInputReports(BLERemoteService *hidService) {
       continue;
     }
 
-    keyboardInputSubscriptions.push_back({characteristic, reportId});
-    characteristic->registerForNotify(onHidReport);
+    if (keyboardInputSubscriptions.size() == kMaxInputReports) {
+      Serial.println("Too many keyboard input reports");
+      return 0;
+    }
+    for (const auto &subscription : keyboardInputSubscriptions) {
+      if (subscription.reportId == reportId) {
+        Serial.println("Duplicate keyboard report ID");
+        return 0;
+      }
+    }
+    BLERemoteDescriptor *configuration =
+        characteristic->getDescriptor(BLEUUID(uint16_t{0x2902}));
+    if (configuration == nullptr) {
+      return 0;
+    }
+
+    const QueueHandle_t mailbox = inputMailboxes[keyboardInputSubscriptions.size()];
+    xQueueReset(mailbox);
+    keyboardInputSubscriptions.push_back({characteristic, reportId, mailbox});
+    const uint32_t generation = connectionGeneration;
+    characteristic->registerForNotify(
+        [mailbox, generation](BLERemoteCharacteristic *, uint8_t *data,
+                              size_t length, bool) {
+          RawInputReport report{};
+          report.generation = generation;
+          report.length = length;
+          if (length <= sizeof(report.data)) {
+            std::memcpy(report.data, data, length);
+          }
+          xQueueOverwrite(mailbox, &report);
+        });
+
+    // registerForNotify() returns void in this Arduino version. Verify both
+    // its GATT completion event and the remote notification-enable bit.
+    const std::string configurationValue = configuration->readValue();
+    processBleEvents();
+    if (linkDisconnected || pairingRejected ||
+        keyboardInputSubscriptions.empty() ||
+        !keyboardInputSubscriptions.back().registered ||
+        configurationValue.size() != 2 ||
+        (static_cast<uint8_t>(configurationValue[0]) & 1) == 0) {
+      Serial.println("Could not enable HID notifications");
+      return 0;
+    }
     Serial.printf("[STATUS] subscribed to keyboard HID report %u\n", reportId);
     ++subscribed;
   }
@@ -398,10 +530,6 @@ size_t subscribeToInputReports(BLERemoteService *hidService) {
 }
 
 bool connectToKeyboard() {
-  if (keyboardAddress == nullptr) {
-    return false;
-  }
-
   if (client == nullptr) {
     client = BLEDevice::createClient();
     client->setClientCallbacks(&clientCallbacks);
@@ -409,26 +537,38 @@ bool connectToKeyboard() {
 
   authenticated = false;
   authenticationFinished = false;
-  Serial.printf("[STATUS] connecting to %s...\n", keyboardAddress->toString().c_str());
+  pairingRejected = false;
+  linkDisconnected = false;
+  ++connectionGeneration;
+  Serial.printf("[STATUS] connecting to %s...\n", keyboardAddress.toString().c_str());
 
-  if (!client->connect(*keyboardAddress, keyboardAddressType)) {
+  if (!client->connect(keyboardAddress, keyboardAddressType)) {
     Serial.println("[STATUS] connection failed");
     return false;
   }
 
   // Encryption starts automatically because setup() configures an encryption
   // level. Give the pairing/bonding exchange time to complete.
-  const uint32_t authenticationDeadline = millis() + 15000;
-  while (!authenticationFinished && client->isConnected() &&
-         static_cast<int32_t>(authenticationDeadline - millis()) > 0) {
-    delay(20);
+  Serial.println("[STATUS] BLE link connected; authenticating");
+  const uint32_t authenticationDeadline = millis() + kAuthenticationTimeoutMs;
+  while (!authenticationFinished && !pairingRejected && !linkDisconnected &&
+         client->isConnected() && !deadlineReached(millis(), authenticationDeadline)) {
+    processBleEvents();
+    delay(5);
   }
+  processBleEvents();
 
-  if (authenticationFinished && !authenticated) {
+  if (!authenticationFinished || !authenticated || pairingRejected ||
+      linkDisconnected || !client->isConnected()) {
+    Serial.println("[STATUS] authentication incomplete or failed; retrying");
     client->disconnect();
     return false;
   }
 
+  // getServices() clears Arduino's cached remote objects and performs service
+  // discovery again. Never use old characteristic pointers after this call.
+  keyboardInputSubscriptions.clear();
+  client->getServices();
   BLERemoteService *hidService = client->getService(BLEUUID(kHidServiceUuid));
   if (hidService == nullptr) {
     Serial.println("Connected device has no BLE HID service");
@@ -443,11 +583,19 @@ bool connectToKeyboard() {
     return false;
   }
 
+  processBleEvents();
+  if (!authenticated || pairingRejected || linkDisconnected || !client->isConnected()) {
+    client->disconnect();
+    return false;
+  }
   connected = true;
+  rememberPreferredIdentity(authenticatedPeer);
   Serial.printf("[STATUS] connected; listening to %u HID input report(s)\n",
                 static_cast<unsigned>(reportCount));
   return true;
 }
+
+void onScanComplete(BLEScanResults) {}
 
 void scanForKeyboard() {
   Serial.printf("[STATUS] searching for %s...\n", kKeyboardName);
@@ -456,14 +604,72 @@ void scanForKeyboard() {
   scan->setActiveScan(true);
   scan->setInterval(100);
   scan->setWindow(80);
-  scan->start(kScanSeconds, false);
   scan->clearResults();
+  xQueueReset(candidateQueue);
+  // The asynchronous scan lets loop() consume candidates and BLE events.
+  scan->start(kScanSeconds, onScanComplete, false);
+  nextScanAt = millis() + kScanSeconds * 1000 + kRetryDelayMs;
+}
 
-  if (!connectRequested) {
-    Serial.println("[STATUS] keyboard not found; retrying shortly");
-    Serial.println("[PAIRING] hold an Easy-Switch key until it blinks rapidly");
-    nextScanAt = millis() + kRetryDelayMs;
+void selectConnectionCandidate() {
+  if (pairingRejected || (client != nullptr && client->isConnected())) {
+    return;
   }
+  AdvertisementCandidate candidate;
+  while (!connected && !connectRequested &&
+         xQueueReceive(candidateQueue, &candidate, 0) == pdTRUE) {
+    const BLEAddress address(candidate.address);
+    esp_bd_addr_t preferred{};
+    const bool preferredIdentity =
+        preferences.getBytes("identity", preferred, sizeof(preferred)) == sizeof(preferred) &&
+        std::memcmp(preferred, candidate.address, sizeof(preferred)) == 0 &&
+        preferences.getUChar("addr-type", 0xFF) == candidate.addressType;
+    const bool knownIdentity = preferredIdentity || isBondedAddress(address);
+    // A nameless private address cannot be matched by raw address. With bonds
+    // present, HID + keyboard appearance is a candidate; authentication lets
+    // Bluedroid resolve it against its stored identity keys.
+    const bool privateKeyboardCandidate = !bondedDevices.empty() &&
+        candidate.advertisesHid && candidate.keyboardAppearance;
+    if (!candidate.matchesName && !knownIdentity && !privateKeyboardCandidate) {
+      continue;
+    }
+    keyboardAddress = address;
+    keyboardAddressType = candidate.addressType;
+    connectRequested = true;
+    BLEDevice::getScan()->stop();
+    xQueueReset(candidateQueue);
+    Serial.println("[STATUS] keyboard candidate found; authenticating before use");
+  }
+}
+
+void consumeKeyboardReports() {
+  bool changed = false;
+  for (auto &subscription : keyboardInputSubscriptions) {
+    RawInputReport raw;
+    if (xQueueReceive(subscription.mailbox, &raw, 0) != pdTRUE ||
+        raw.generation != connectionGeneration) {
+      continue;
+    }
+    if (raw.length > sizeof(raw.data) ||
+        !hidReportMap.decodeKeyboardInput(subscription.reportId, raw.data,
+                                         raw.length, subscription.state)) {
+      // A malformed release must not leave a previously pressed key repeating.
+      pairingRejected = true;
+      releaseOutput();
+      Serial.println("[STATUS] invalid HID input; reconnecting");
+      return;
+    }
+    changed = true;
+  }
+  if (!changed) {
+    return;
+  }
+
+  HidKeyboardReport aggregate{};
+  for (const auto &subscription : keyboardInputSubscriptions) {
+    mergeKeyboardReport(aggregate, subscription.state);
+  }
+  applyKeyboardReport(aggregate);
 }
 }  // namespace
 
@@ -484,21 +690,31 @@ void setup() {
   digitalWrite(NEOPIXEL_POWER, NEOPIXEL_POWER_ON);
   setLed(false);
 
-  kcKeyboard.begin();
-  keyboardReportQueue =
-      xQueueCreate(kKeyboardReportQueueLength, sizeof(HidKeyboardReport));
-  if (keyboardReportQueue == nullptr) {
-    Serial.println("Could not allocate the HID keyboard report queue");
+  bleEventQueue = xQueueCreate(32, sizeof(BleEvent));
+  candidateQueue = xQueueCreate(32, sizeof(AdvertisementCandidate));
+  bool queuesReady = bleEventQueue && candidateQueue;
+  for (auto &mailbox : inputMailboxes) {
+    mailbox = xQueueCreate(1, sizeof(RawInputReport));
+    queuesReady = queuesReady && mailbox;
   }
+  if (!queuesReady || !kcOutput.begin()) {
+    Serial.println("Could not allocate keyboard queues/output task; halted");
+    for (;;) {
+      delay(1000);
+    }
+  }
+  preferences.begin("kc85-keyboard", false);
 
   Serial.println("Initializing BLE...");
   BLEDevice::init("QT Py keyboard host");
   Serial.println("BLE initialized");
-  BLEDevice::setSecurityCallbacks(&securityCallbacks);
-  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-  security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+  BLEDevice::setCustomGapHandler(onGapEvent);
+  BLEDevice::setCustomGattcHandler(onGattEvent);
+  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
+  security.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  security.setKeySize(16);
   // The MX Keys Mini enters a passkey displayed by its host. Advertise a
-  // display-only capability so the passkey arrives in onPassKeyNotify().
+  // display-only capability so GAP delivers a passkey notification.
   security.setCapability(ESP_IO_CAP_OUT);
   security.setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   security.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
@@ -523,24 +739,37 @@ void loop() {
     nextConsoleHeartbeatAt = now + kConsoleHeartbeatMs;
   }
 
-  HidKeyboardReport report;
-  if (keyboardReportQueue != nullptr &&
-      xQueueReceive(keyboardReportQueue, &report, 0) == pdTRUE) {
-    applyKeyboardReport(report);
+  processBleEvents();
+  if (pairingRejected) {
+    connected = false;
+    releaseOutput();
+    keyboardInputSubscriptions.clear();
+    if (client != nullptr && client->isConnected()) {
+      client->disconnect();
+    }
+    // Wait for the disconnect event before trying another connection.
+    if (client == nullptr || !client->isConnected()) {
+      pairingRejected = false;
+      nextScanAt = millis() + kRetryDelayMs;
+    }
   }
-  kcKeyboard.service();
+  if (connected) {
+    consumeKeyboardReports();
+  }
 
   if (ledOffAt != 0 && static_cast<int32_t>(millis() - ledOffAt) >= 0) {
     setLed(false);
     ledOffAt = 0;
   }
 
+  selectConnectionCandidate();
   if (connectRequested) {
     connectRequested = false;
     if (!connectToKeyboard()) {
       nextScanAt = millis() + kRetryDelayMs;
     }
-  } else if (!connected &&
+  } else if (!connected && !pairingRejected &&
+             (client == nullptr || !client->isConnected()) &&
              static_cast<int32_t>(millis() - nextScanAt) >= 0) {
     scanForKeyboard();
   }
