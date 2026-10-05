@@ -38,9 +38,9 @@ constexpr uint8_t kLedBrightness = 24;
 constexpr uint8_t kKcDataPin = A0;
 constexpr size_t kMaxInputReports = 16;
 constexpr size_t kMaxReportBytes = 512;
+constexpr size_t kInputReportQueueLength = 32;
 constexpr uint32_t kAuthenticationTimeoutMs = 15000;
 constexpr uint16_t kKeyboardAppearance = 0x03C1;
-constexpr uint8_t kShiftModifierMask = 0x22;
 
 BLEClient *client = nullptr;
 BLEAddress keyboardAddress("00:00:00:00:00:00");
@@ -49,6 +49,7 @@ std::vector<esp_ble_bond_dev_t> bondedDevices;
 Preferences preferences;
 Kc85Output kcOutput(kKcDataPin);
 HidReportMap hidReportMap;
+HidKeyboardTransitions keyboardTransitions;
 
 // Callbacks copy data into queues. Only loop() owns connection state, the
 // report map, subscriptions and bonds. Kc85Output owns the transmitter.
@@ -74,22 +75,22 @@ struct AdvertisementCandidate {
 };
 struct RawInputReport {
   uint32_t generation;
+  uint8_t reportId;
   size_t length;
   uint8_t data[kMaxReportBytes];
 };
 QueueHandle_t bleEventQueue = nullptr;
 QueueHandle_t candidateQueue = nullptr;
-QueueHandle_t inputMailboxes[kMaxInputReports]{};
+QueueHandle_t inputReportQueue = nullptr;
 std::atomic<bool> bleEventOverflow{false};
+std::atomic<bool> inputReportOverflow{false};
 uint32_t connectionGeneration = 0;
 
 struct KeyboardInputSubscription {
-  KeyboardInputSubscription(BLERemoteCharacteristic *input, uint8_t id,
-                            QueueHandle_t queue)
-      : characteristic(input), reportId(id), mailbox(queue) {}
+  KeyboardInputSubscription(BLERemoteCharacteristic *input, uint8_t id)
+      : characteristic(input), reportId(id) {}
   BLERemoteCharacteristic *characteristic;
   uint8_t reportId;
-  QueueHandle_t mailbox;
   HidKeyboardReport state{};
   bool registered = false;
 };
@@ -115,6 +116,11 @@ void queueBleEvent(const BleEvent &event) {
 
 void releaseOutput() {
   kcOutput.release();
+}
+
+void cancelOutput() {
+  keyboardTransitions.reset();
+  kcOutput.cancel();
 }
 
 uint32_t nextScanAt = 0;
@@ -198,18 +204,6 @@ void rememberPreferredIdentity(const esp_ble_auth_cmpl_t &result) {
   preferences.putUChar("addr-type", static_cast<uint8_t>(type));
 }
 
-bool reportHasPressedKey(const HidKeyboardReport &report) {
-  if (report.modifiers != 0) {
-    return true;
-  }
-  for (uint8_t usage : report.keys) {
-    if (usage != 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 void printHidUsage(uint8_t usage) {
   if (usage >= 0x04 && usage <= 0x1D) {
     Serial.printf("%c(0x%02X)", 'A' + usage - 0x04, usage);
@@ -272,33 +266,35 @@ void printPressedKeyboardReport(const HidKeyboardReport &report) {
 }
 
 void applyKeyboardReport(const HidKeyboardReport &report) {
-  if (reportHasPressedKey(report)) {
-    printPressedKeyboardReport(report);
-    setLed(true);
-    ledOffAt = millis() + kKeyFlashMs;
-  }
-
-  const bool shifted = (report.modifiers & kShiftModifierMask) != 0;
-  for (uint8_t usage : report.keys) {
-    uint8_t iso7Code;
+  HidKeyboardEvent events[HidKeyboardTransitions::MaxEvents];
+  const size_t count = keyboardTransitions.update(report, events);
+  bool flashed = false;
+  for (size_t index = 0; index < count; ++index) {
+    const auto &event = events[index];
+    if (event.usage == 0) {
+      releaseOutput();
+      Serial.println("[KEY] active key released");
+      continue;
+    }
     KcKey kcKey;
     bool kcShifted;
-    if (usage != 0 && hidUsageToIso7(usage, shifted, iso7Code) &&
-        Kc85Keyboard::keyForIso7(iso7Code, kcKey, kcShifted)) {
+    if (Kc85Keyboard::keyForIso7(event.iso7Code, kcKey, kcShifted)) {
+      if (!flashed) {
+        printPressedKeyboardReport(report);
+        setLed(true);
+        ledOffAt = millis() + kKeyFlashMs;
+        flashed = true;
+      }
+      // A distinct physical press must also be distinct when two HID usages
+      // map to the same KC85 key (e.g. Enter and keypad Enter).
+      releaseOutput();
       kcOutput.press(kcKey, kcShifted);
       Serial.printf("[KEY] HID 0x%02X -> ISO-7 0x%02X -> KC85 IBUS 0x%02X",
-                    usage, iso7Code,
+                    event.usage, event.iso7Code,
                     Kc85Keyboard::ibusForKey(kcKey, kcShifted));
       Serial.println();
-      return;
     }
   }
-
-  // A release, modifier-only report, or unsupported key stops KC85 repeats.
-  releaseOutput();
-  Serial.println(reportHasPressedKey(report)
-                     ? "[KEY] no supported KC85 key in report"
-                     : "[KEY] all keys released");
 }
 
 class KeyboardAdvertisementCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -379,7 +375,7 @@ void processBleEvents() {
         authenticated = false;
         linkDisconnected = true;
         keyboardInputSubscriptions.clear();
-        releaseOutput();
+        cancelOutput();
         nextScanAt = millis() + kRetryDelayMs;
         Serial.println("[STATUS] keyboard disconnected; scanning will resume");
         break;
@@ -495,20 +491,21 @@ size_t subscribeToInputReports(BLERemoteService *hidService) {
       return 0;
     }
 
-    const QueueHandle_t mailbox = inputMailboxes[keyboardInputSubscriptions.size()];
-    xQueueReset(mailbox);
-    keyboardInputSubscriptions.push_back({characteristic, reportId, mailbox});
+    keyboardInputSubscriptions.push_back({characteristic, reportId});
     const uint32_t generation = connectionGeneration;
     characteristic->registerForNotify(
-        [mailbox, generation](BLERemoteCharacteristic *, uint8_t *data,
-                              size_t length, bool) {
+        [reportId, generation](BLERemoteCharacteristic *, uint8_t *data,
+                               size_t length, bool) {
           RawInputReport report{};
           report.generation = generation;
+          report.reportId = reportId;
           report.length = length;
           if (length <= sizeof(report.data)) {
             std::memcpy(report.data, data, length);
           }
-          xQueueOverwrite(mailbox, &report);
+          if (xQueueSend(inputReportQueue, &report, 0) != pdTRUE) {
+            inputReportOverflow.store(true);
+          }
         });
 
     // registerForNotify() returns void in this Arduino version. Verify both
@@ -540,6 +537,9 @@ bool connectToKeyboard() {
   pairingRejected = false;
   linkDisconnected = false;
   ++connectionGeneration;
+  keyboardTransitions.reset();
+  xQueueReset(inputReportQueue);
+  inputReportOverflow.store(false);
   Serial.printf("[STATUS] connecting to %s...\n", keyboardAddress.toString().c_str());
 
   if (!client->connect(keyboardAddress, keyboardAddressType)) {
@@ -643,33 +643,42 @@ void selectConnectionCandidate() {
 }
 
 void consumeKeyboardReports() {
-  bool changed = false;
-  for (auto &subscription : keyboardInputSubscriptions) {
-    RawInputReport raw;
-    if (xQueueReceive(subscription.mailbox, &raw, 0) != pdTRUE ||
-        raw.generation != connectionGeneration) {
+  RawInputReport raw;
+  while (xQueueReceive(inputReportQueue, &raw, 0) == pdTRUE) {
+    if (raw.generation != connectionGeneration) {
+      continue;
+    }
+
+    auto subscription = std::find_if(
+        keyboardInputSubscriptions.begin(), keyboardInputSubscriptions.end(),
+        [&raw](const KeyboardInputSubscription &candidate) {
+          return candidate.reportId == raw.reportId;
+        });
+    if (subscription == keyboardInputSubscriptions.end()) {
       continue;
     }
     if (raw.length > sizeof(raw.data) ||
-        !hidReportMap.decodeKeyboardInput(subscription.reportId, raw.data,
-                                         raw.length, subscription.state)) {
+        !hidReportMap.decodeKeyboardInput(subscription->reportId, raw.data,
+                                          raw.length, subscription->state)) {
       // A malformed release must not leave a previously pressed key repeating.
       pairingRejected = true;
-      releaseOutput();
+      cancelOutput();
       Serial.println("[STATUS] invalid HID input; reconnecting");
       return;
     }
-    changed = true;
-  }
-  if (!changed) {
-    return;
+
+    HidKeyboardReport aggregate{};
+    for (const auto &current : keyboardInputSubscriptions) {
+      mergeKeyboardReport(aggregate, current.state);
+    }
+    applyKeyboardReport(aggregate);
   }
 
-  HidKeyboardReport aggregate{};
-  for (const auto &subscription : keyboardInputSubscriptions) {
-    mergeKeyboardReport(aggregate, subscription.state);
+  if (inputReportOverflow.exchange(false)) {
+    pairingRejected = true;
+    cancelOutput();
+    Serial.println("[STATUS] HID input queue overflow; reconnecting");
   }
-  applyKeyboardReport(aggregate);
 }
 }  // namespace
 
@@ -692,11 +701,9 @@ void setup() {
 
   bleEventQueue = xQueueCreate(32, sizeof(BleEvent));
   candidateQueue = xQueueCreate(32, sizeof(AdvertisementCandidate));
-  bool queuesReady = bleEventQueue && candidateQueue;
-  for (auto &mailbox : inputMailboxes) {
-    mailbox = xQueueCreate(1, sizeof(RawInputReport));
-    queuesReady = queuesReady && mailbox;
-  }
+  inputReportQueue =
+      xQueueCreate(kInputReportQueueLength, sizeof(RawInputReport));
+  const bool queuesReady = bleEventQueue && candidateQueue && inputReportQueue;
   if (!queuesReady || !kcOutput.begin()) {
     Serial.println("Could not allocate keyboard queues/output task; halted");
     for (;;) {
@@ -742,7 +749,7 @@ void loop() {
   processBleEvents();
   if (pairingRejected) {
     connected = false;
-    releaseOutput();
+    cancelOutput();
     keyboardInputSubscriptions.clear();
     if (client != nullptr && client->isConnected()) {
       client->disconnect();

@@ -94,7 +94,8 @@ public:
   // Call service() continuously from the task that owns this object.
   // Transmission of one word is synchronous: its spacings are timing-critical.
   // All state-changing methods must also be called from that same task.
-  void service();
+  // Returns true when one complete word was transmitted.
+  bool service();
 
   // SHIFT is an electrical plane selector in the original keyboard, not a
   // separately transmitted matrix key. ShiftLock is a normal matrix key.
@@ -118,8 +119,8 @@ public:
   bool isShifted() const;
 
   // The received IBUS value uses bit 7 for the plane and bits 0..5 for the
-  // matrix position. Bit 6 is unused. The hardware path has inverted plane
-  // polarity, so shifted=false transmits bit 7 set and shifted=true clears it.
+  // matrix position. Bit 6 is unused. On this hardware the base plane sends
+  // bit 7 set; the SHIFT plane clears it. pressIbus() uses the same polarity.
   static uint8_t ibusForKey(KcKey key, bool shifted);
 
   // iso7Code is searched in the table; key and shifted receive the result.

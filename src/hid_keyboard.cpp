@@ -25,6 +25,45 @@ constexpr PrintablePair PrintableKeys[] = {
 };
 } // namespace
 
+void HidKeyboardTransitions::reset()
+{
+  previous_ = HidKeyboardReport{};
+  activeUsage_ = 0;
+}
+
+size_t HidKeyboardTransitions::update(
+    const HidKeyboardReport &report, HidKeyboardEvent (&events)[MaxEvents])
+{
+  size_t count = 0;
+  if (activeUsage_ != 0 &&
+      std::find(std::begin(report.keys), std::end(report.keys), activeUsage_) ==
+          std::end(report.keys))
+  {
+    events[count++] = {0, 0};
+    activeUsage_ = 0;
+  }
+
+  const bool shifted = (report.modifiers & 0x22) != 0;
+  for (size_t index = 0; index < sizeof(report.keys); ++index)
+  {
+    const uint8_t usage = report.keys[index];
+    uint8_t iso7;
+    if (usage == 0 ||
+        std::find(std::begin(previous_.keys), std::end(previous_.keys), usage) !=
+            std::end(previous_.keys) ||
+        std::find(report.keys, report.keys + index, usage) !=
+            report.keys + index ||
+        !hidUsageToIso7(usage, shifted, iso7))
+    {
+      continue;
+    }
+    events[count++] = {usage, iso7};
+    activeUsage_ = usage;
+  }
+  previous_ = report;
+  return count;
+}
+
 void mergeKeyboardReport(HidKeyboardReport &aggregate,
                          const HidKeyboardReport &report)
 {
@@ -47,10 +86,10 @@ void mergeKeyboardReport(HidKeyboardReport &aggregate,
 
 bool hidUsageToIso7(uint8_t usage, bool shifted, uint8_t &iso7Code)
 {
-  // Keyboard a/A through z/Z.
+  // Match the KC85 keyboard: uppercase on the base plane, lowercase on SHIFT.
   if (usage >= 0x04 && usage <= 0x1D)
   {
-    iso7Code = static_cast<uint8_t>((shifted ? 'A' : 'a') + usage - 0x04);
+    iso7Code = static_cast<uint8_t>((shifted ? 'a' : 'A') + usage - 0x04);
     return true;
   }
 

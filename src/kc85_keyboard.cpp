@@ -44,11 +44,11 @@ void Kc85Keyboard::begin()
   pinMode(dataPin_, OUTPUT);
 }
 
-void Kc85Keyboard::service()
+bool Kc85Keyboard::service()
 {
   if (!pressed_ || !deadlineReached(micros(), nextFrameAt_))
   {
-    return;
+    return false;
   }
 
   // Complete documented IBUS value for the currently held key and plane.
@@ -56,6 +56,7 @@ void Kc85Keyboard::service()
   lastBoundaryAt_ = sendFrame(ibusCode);
   haveBoundary_ = true;
   nextFrameAt_ = lastBoundaryAt_ + WordSpacingUs;
+  return true;
 }
 
 void Kc85Keyboard::setShiftPlane(bool shifted)
@@ -99,7 +100,7 @@ bool Kc85Keyboard::pressIbus(uint8_t ibusCode)
 
   // Matrix key extracted from the lower six bits of documented IBUS code.
   const KcKey key = static_cast<KcKey>(ibusCode & 0x3FU);
-  return pressKey(key, (ibusCode & 0x80U) != 0);
+  return pressKey(key, (ibusCode & 0x80U) == 0);
 }
 
 bool Kc85Keyboard::pressIso7(uint8_t iso7Code)
@@ -252,10 +253,18 @@ void Kc85Keyboard::sendBurst()
 
 void Kc85Keyboard::waitUntil(uint32_t deadline)
 {
-  while (!deadlineReached(micros(), deadline))
+  for (;;)
   {
+    // Use the same timestamp for the deadline check and subtraction. A second
+    // micros() read could cross the deadline and underflow remaining, causing
+    // delayMicroseconds() to busy-wait for almost 2^32 us (71 minutes).
+    const uint32_t now = micros();
+    if (deadlineReached(now, deadline))
+    {
+      return;
+    }
     // Microseconds still available before the requested absolute deadline.
-    const uint32_t remaining = deadline - micros();
+    const uint32_t remaining = deadline - now;
     if (remaining > 32)
     {
       delayMicroseconds(remaining - 16);

@@ -49,10 +49,15 @@ arrays and one-bit-per-key (NKRO) input reports. It uses the USB HID US logical
 layout. Letters, digits, KC85-supported punctuation, Enter, Space, Backspace,
 Tab, Caps Lock, F1-F12, Insert, Home, Delete, arrow keys, Escape/Pause (BREAK),
 and keypad digits/operators are translated.
-Left/Right Shift select uppercase letters and shifted symbols. Ctrl, Alt,
+Letters default to uppercase, like the original KC85 keyboard. Left/Right
+Shift select lowercase letters and shifted symbols; unshifted digits remain
+digits and Space remains Space with or without Shift. Ctrl, Alt,
 GUI, media keys, and characters unavailable on the KC85 are not forwarded.
-When several normal keys are held, the first supported key in the report is
-sent because the KC85 protocol represents one active key at a time.
+Each supported key is sent once when it is newly pressed, with Shift captured
+at key-down. Changing Shift while holding a key does not generate another
+character. When keys overlap, the most recently pressed supported key becomes
+the active key for repeats. Releasing it stops repeats without replaying older
+keys that remain held, because the KC85 represents one active key at a time.
 
 ## Firmware structure
 
@@ -63,18 +68,20 @@ Every reconnect rediscovers GATT services and rebuilds the Report Map and Report
 Reference mappings. The keyboard becomes ready only after authentication and
 verified notification registration.
 
-Each keyboard input report ID has a one-element overwrite mailbox and its own
-decoded state. The owner combines those states, including modifiers, removes
-duplicate keys, and retains the first six distinct key usages. A release from
-one report ID therefore does not release keys still held in another. The
-firmware supports up to 16 keyboard input reports of up to 512 bytes each;
-invalid reports disconnect the keyboard and release the output.
+Raw keyboard notifications enter one ordered queue, and every input report ID
+has its own decoded state. The owner applies reports in arrival order, combines
+those states (including modifiers), removes duplicate keys, and retains the
+first six distinct key usages. A release from one report ID therefore does not
+release keys still held in another. The firmware supports up to 16 keyboard
+input reports of up to 512 bytes each; invalid reports or queue overflow
+disconnect the keyboard and release the output rather than leaving a key stuck.
 
 `src/kc85_output.cpp` owns the KC85 transmitter in a task on the other CPU core.
-It receives the latest translated key through another overwrite mailbox, while
+It receives translated key transitions through an ordered queue, while
 `src/kc85_keyboard.cpp` generates the original pulse protocol. A frame already
-on the wire completes in roughly 36–50 ms; the next frame uses the newest state.
-Short presses superseded by a release before transmission may be skipped.
+on the wire completes in roughly 36–50 ms. Every queued press transmits at least
+one complete word before a following release or key change is applied, so quick
+press/release sequences are not lost during the required inter-word gap.
 
 `src/hid_report_map.cpp` parses HID layouts and `src/hid_keyboard.cpp` merges
 keyboard states and translates usages to ISO-7 values.
